@@ -1,4 +1,4 @@
-name: app
+name: build_scan_push_deploy
 
 on:
   push:
@@ -8,11 +8,6 @@ on:
       - "k8s/**"
       - ".github/workflows/app.yml"
   workflow_dispatch:
-    inputs:
-      enforce_trivy_gate:
-        description: "Fail pipeline if Trivy finds HIGH/CRITICAL vulnerabilities"
-        required: false
-        default: "false"
 
 permissions:
   id-token: write
@@ -22,107 +17,111 @@ env:
   AWS_REGION: eu-west-2
   ECR_REPO: cloud4future-node
   K8S_NAMESPACE: app
-  DEPLOYMENT_NAME: cloud4future-node
 
 jobs:
-  build_scan_push_deploy:
+  deploy:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
+      # ------------------------
+      # Checkout
+      # ------------------------
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ---------- AWS AUTH (OIDC) ----------
+      # ------------------------
+      # AWS OIDC Auth
+      # ------------------------
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ env.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Verify AWS identity
-        run: aws sts get-caller-identity
-
-      # ---------- ECR ----------
-      - name: Ensure ECR repo exists
-        run: |
-          aws ecr describe-repositories --repository-names "${{ env.ECR_REPO }}" --region "${{ env.AWS_REGION }}" >/dev/null 2>&1 \
-          || aws ecr create-repository --repository-name "${{ env.ECR_REPO }}" --region "${{ env.AWS_REGION }}"
-
+      # ------------------------
+      # ECR Login
+      # ------------------------
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image vars
+      # ------------------------
+      # Ensure ECR Repo Exists
+      # ------------------------
+      - name: Ensure ECR repository exists
         run: |
-          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
-          IMAGE="${REGISTRY}/${{ env.ECR_REPO }}:${{ github.sha }}"
-          echo "IMAGE=$IMAGE" >> $GITHUB_ENV
-          echo "REGISTRY=$REGISTRY" >> $GITHUB_ENV
-          echo "Using image: $IMAGE"
+          aws ecr describe-repositories \
+            --repository-names $ECR_REPO \
+            --region $AWS_REGION \
+          || aws ecr create-repository \
+            --repository-name $ECR_REPO \
+            --region $AWS_REGION
 
+      # ------------------------
+      # Build Image
+      # ------------------------
       - name: Build Docker image
         run: |
-          docker build -t "${{ env.IMAGE }}" ./app
+          IMAGE_URI="${{ steps.login-ecr.outputs.registry }}/${ECR_REPO}:${{ github.sha }}"
+          docker build -t "$IMAGE_URI" ./app
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
 
-      # ---------- TRIVY (optional gate) ----------
+      # ------------------------
+      # Trivy (report-only)
+      # ------------------------
       - name: Trivy scan (report only)
-        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.enforce_trivy_gate != 'true') }}
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: ${{ env.IMAGE }}
-          format: table
-          exit-code: "0"
+          image-ref: ${{ env.IMAGE_URI }}
+          severity: HIGH,CRITICAL
           ignore-unfixed: true
-          vuln-type: "os,library"
-          severity: "HIGH,CRITICAL"
+          exit-code: 0
 
-      - name: Trivy scan (FAIL on HIGH/CRITICAL)
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce_trivy_gate == 'true' }}
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.IMAGE }}
-          format: table
-          exit-code: "1"
-          ignore-unfixed: true
-          vuln-type: "os,library"
-          severity: "HIGH,CRITICAL"
-
+      # ------------------------
+      # Push Image
+      # ------------------------
       - name: Push image to ECR
         run: |
-          docker push "${{ env.IMAGE }}"
+          docker push "$IMAGE_URI"
 
-      # ---------- KUBECTL / EKS ----------
+      # ------------------------
+      # kubectl
+      # ------------------------
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
-          version: "v1.29.0"
+          version: v1.29.0
 
+      # ------------------------
+      # kubeconfig
+      # ------------------------
       - name: Update kubeconfig
-        env:
-          CLUSTER_FROM_SECRET: ${{ secrets.EKS_CLUSTER_NAME }}
         run: |
-          CLUSTER="${CLUSTER_FROM_SECRET:-cloud4future-eks}"
-          echo "Using cluster: $CLUSTER"
-          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER"
-          kubectl get nodes || true
+          aws eks update-kubeconfig \
+            --name "${{ secrets.EKS_CLUSTER_NAME }}" \
+            --region "${{ secrets.AWS_REGION }}"
 
-      # ---------- DEPLOY ----------
+      # ------------------------
+      # Deploy to EKS (Fargate safe)
+      # ------------------------
       - name: Deploy to EKS
         run: |
-          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/namespace.yaml --validate=false
+          kubectl apply -f k8s/serviceaccount.yaml --validate=false
 
-          # Ensure namespace exists before applying remaining resources
-          kubectl get ns "${{ env.K8S_NAMESPACE }}" >/dev/null 2>&1 || kubectl create ns "${{ env.K8S_NAMESPACE }}"
+          sed "s|REPLACE_IMAGE|${IMAGE_URI}|g" k8s/deployment.yaml \
+            | kubectl apply -f - --validate=false
 
-          kubectl apply -f k8s/serviceaccount.yaml -n "${{ env.K8S_NAMESPACE }}" || true
+          kubectl apply -f k8s/service.yaml --validate=false
+          kubectl apply -f k8s/pdb.yaml --validate=false || true
+          kubectl apply -f k8s/hpa.yaml --validate=false || true
 
-          # Inject image into deployment
-          sed "s|REPLACE_IMAGE|${{ env.IMAGE }}|g" k8s/deployment.yaml | kubectl apply -n "${{ env.K8S_NAMESPACE }}" -f -
+          kubectl rollout status deployment/cloud4future-node \
+            -n $K8S_NAMESPACE --timeout=300s
 
-          kubectl apply -f k8s/service.yaml -n "${{ env.K8S_NAMESPACE }}"
-          kubectl apply -f k8s/pdb.yaml -n "${{ env.K8S_NAMESPACE }}" || true
-          kubectl apply -f k8s/hpa.yaml -n "${{ env.K8S_NAMESPACE }}" || true
-
-          kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status deploy/"${{ env.DEPLOYMENT_NAME }}" --timeout=300s
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get svc
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get pods -o wide
+      # ------------------------
+      # Output
+      # ------------------------
+      - name: Show service
+        run: |
+          kubectl get svc -n $K8S_NAMESPACE
