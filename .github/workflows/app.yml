@@ -22,22 +22,24 @@ env:
 jobs:
   build_scan_push_deploy:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
-
-      - name: Validate required secrets (quick sanity)
-        run: |
-          if [ -z "${{ secrets.AWS_ROLE_TO_ASSUME }}" ]; then
-            echo "Missing secret: AWS_ROLE_TO_ASSUME"
-            exit 1
-          fi
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ env.AWS_REGION }}
+
+      - name: Ensure ECR repo exists
+        run: |
+          aws ecr describe-repositories \
+            --repository-names "${{ env.ECR_REPO }}" \
+            --region "${{ env.AWS_REGION }}" >/dev/null 2>&1 \
+          || aws ecr create-repository \
+            --repository-name "${{ env.ECR_REPO }}" \
+            --image-scanning-configuration scanOnPush=true \
+            --region "${{ env.AWS_REGION }}"
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -48,11 +50,8 @@ jobs:
           echo "IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_ENV
 
       - name: Build Docker image
-        run: |
-          docker build -t "${{ env.IMAGE }}" ./app
+        run: docker build -t "${{ env.IMAGE }}" ./app
 
-      # ✅ This will SHOW vulnerabilities but will NOT fail your pipeline.
-      # If you want it to fail, change exit-code to "1" and remove "|| true".
       - name: Trivy scan (report only - does not block deploy)
         uses: aquasecurity/trivy-action@0.28.0
         with:
@@ -64,8 +63,7 @@ jobs:
           severity: "HIGH,CRITICAL"
 
       - name: Push image to ECR
-        run: |
-          docker push "${{ env.IMAGE }}"
+        run: docker push "${{ env.IMAGE }}"
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -78,33 +76,21 @@ jobs:
           if [ -z "$CLUSTER" ]; then
             CLUSTER="${{ env.DEFAULT_EKS_CLUSTER_NAME }}"
           fi
-          echo "Using cluster: $CLUSTER"
           aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER"
 
       - name: Deploy to EKS
         run: |
-          # Namespace
           kubectl apply -f k8s/namespace.yaml || true
 
-          # (Optional) serviceaccount if you use it
           if [ -f k8s/serviceaccount.yaml ]; then
             kubectl apply -f k8s/serviceaccount.yaml
           fi
 
-          # Deployment (inject image)
           sed "s|REPLACE_IMAGE|${{ env.IMAGE }}|g" k8s/deployment.yaml | kubectl apply -f -
-
-          # Service + extras
           kubectl apply -f k8s/service.yaml
 
-          if [ -f k8s/pdb.yaml ]; then
-            kubectl apply -f k8s/pdb.yaml || true
-          fi
+          if [ -f k8s/pdb.yaml ]; then kubectl apply -f k8s/pdb.yaml || true; fi
+          if [ -f k8s/hpa.yaml ]; then kubectl apply -f k8s/hpa.yaml || true; fi
 
-          if [ -f k8s/hpa.yaml ]; then
-            kubectl apply -f k8s/hpa.yaml || true
-          fi
-
-          # Rollout + show service
           kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status deploy/cloud4future-node --timeout=300s
           kubectl -n "${{ env.K8S_NAMESPACE }}" get svc cloud4future-node-svc -o wide
