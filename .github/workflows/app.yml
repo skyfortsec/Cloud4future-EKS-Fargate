@@ -2,7 +2,7 @@ name: app
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths:
       - "app/**"
       - "k8s/**"
@@ -13,6 +13,17 @@ permissions:
   id-token: write
   contents: read
 
+concurrency:
+  group: app-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: eu-west-2
+  AWS_ACCOUNT_ID: "361040591888"   # optional; safe to hardcode if correct
+  ECR_REPO: cloud4future-node
+  NAMESPACE: app
+  DEFAULT_CLUSTER_NAME: cloud4future-eks-fargate
+
 jobs:
   build_scan_push_deploy:
     runs-on: ubuntu-latest
@@ -20,11 +31,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # ✅ Use the secret name you already created (from your screenshot)
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
 
       - name: Login to Amazon ECR
         id: login-ecr
@@ -32,13 +47,15 @@ jobs:
 
       - name: Set image vars
         run: |
-          echo "ECR_REPO=cloud4future-node" >> $GITHUB_ENV
-          echo "IMAGE=${{ steps.login-ecr.outputs.registry }}/cloud4future-node:${{ github.sha }}" >> $GITHUB_ENV
+          echo "IMAGE=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:${{ github.sha }}" >> $GITHUB_ENV
+          echo "IMAGE_LATEST=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPO }}:latest" >> $GITHUB_ENV
 
       - name: Build Docker image
         run: |
-          docker build -t "${{ env.IMAGE }}" ./app
+          docker build -t "${{ env.IMAGE }}" -t "${{ env.IMAGE_LATEST }}" ./app
 
+      # ✅ If you want pipeline to continue even with vulns, set exit-code to "0"
+      # ✅ Keeping your security gate as requested: fail HIGH/CRITICAL
       - name: Trivy scan (fail HIGH/CRITICAL)
         uses: aquasecurity/trivy-action@0.28.0
         with:
@@ -52,6 +69,7 @@ jobs:
       - name: Push image to ECR
         run: |
           docker push "${{ env.IMAGE }}"
+          docker push "${{ env.IMAGE_LATEST }}"
 
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
@@ -59,19 +77,30 @@ jobs:
           version: v1.29.0
 
       - name: Update kubeconfig
+        env:
+          CLUSTER_FROM_SECRET: ${{ secrets.EKS_CLUSTER_NAME }}
         run: |
-          CLUSTER="${{ secrets.EKS_CLUSTER_NAME }}"
-          if [ -z "$CLUSTER" ]; then CLUSTER="cloud4future-eks-fargate"; fi
-          aws eks update-kubeconfig --region "${{ secrets.AWS_REGION }}" --name "$CLUSTER"
+          CLUSTER="${CLUSTER_FROM_SECRET}"
+          if [ -z "$CLUSTER" ]; then CLUSTER="${{ env.DEFAULT_CLUSTER_NAME }}"; fi
+          echo "Using cluster: $CLUSTER"
+          aws eks update-kubeconfig --region "${{ env.AWS_REGION }}" --name "$CLUSTER"
 
       - name: Deploy to EKS
         run: |
+          # Ensure namespace exists
           kubectl apply -f k8s/namespace.yaml
+
+          # Apply other objects
           kubectl apply -f k8s/serviceaccount.yaml
+
+          # Replace image in deployment and apply
           sed "s|REPLACE_IMAGE|${{ env.IMAGE }}|g" k8s/deployment.yaml | kubectl apply -f -
+
           kubectl apply -f k8s/service.yaml
           kubectl apply -f k8s/pdb.yaml
+
+          # HPA may fail if metrics server isn't installed; don't fail the pipeline for that
           kubectl apply -f k8s/hpa.yaml || true
 
-          kubectl -n app rollout status deploy/cloud4future-node --timeout=300s
-          kubectl -n app get svc cloud4future-node-svc
+          kubectl -n "${{ env.NAMESPACE }}" rollout status deploy/cloud4future-node --timeout=300s
+          kubectl -n "${{ env.NAMESPACE }}" get svc cloud4future-node-svc
